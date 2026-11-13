@@ -18,6 +18,7 @@ import {
   resolveInside,
   type KrillinRuntimeManifest
 } from './manifest.js';
+import { normalizeSimplifiedChineseSubtitleOutputs } from './subtitle-script.js';
 import type { YtDlpRuntime } from '../yt-dlp/runtime.js';
 
 export type MaterializedKrillinArtifact = {
@@ -42,6 +43,17 @@ type KrillinCliResponse = {
   task_id?: string;
   outputs?: Record<string, string>;
   warnings?: string[];
+  subtitle_quality?: {
+    status: 'qualified' | 'degraded' | 'failed';
+    approximate_layouts: number;
+    degraded_segmentation_units: number;
+    semantic_pending: number;
+    unresolved_errors?: number;
+    overflow_cues?: number;
+    timing_fallback?: boolean;
+    issues?: Array<{ sentence_id: string; cue?: number; output_cue?: number; timestamp?: string;
+      type: string; severity: string; source_evidence?: string; target_evidence?: string; reason: string }>;
+  };
   translation_failures?: Array<{ sentence_id: string; source_text: string; reason: string }>;
   error?: {
     kind?: string;
@@ -161,6 +173,16 @@ export async function runKrillinCli(input: RunKrillinCliInput): Promise<KrillinR
   if (krillinCliStageId(input.stage.stageRun.stageId) !== 'subtitle') {
     await writeInitialManifest(input.stage, input.options);
   }
+  if (input.stage.stageRun.stageId === 'tts') {
+    const targetSubtitle = input.artifacts.find(artifact => artifact.kind === 'target_subtitle');
+    if (targetSubtitle !== undefined) {
+      await copyFile(targetSubtitle.path, join(input.stage.workdir, 'target_language_srt.srt'));
+    }
+    const sourceSubtitle = input.artifacts.find(artifact => artifact.kind === 'source_subtitle');
+    if (sourceSubtitle !== undefined) {
+      await copyFile(sourceSubtitle.path, join(input.stage.workdir, 'origin_language_srt.srt'));
+    }
+  }
 
   const args = buildKrillinCliCommandArguments(
     input.stage,
@@ -170,7 +192,8 @@ export async function runKrillinCli(input: RunKrillinCliInput): Promise<KrillinR
     input.source
   );
   if (args[0] === 'render-horizontal' || args[0] === 'render-vertical') {
-    const kind = args[0] === 'render-vertical' ? 'vertical_subtitle' : 'target_subtitle';
+    const kind = args[0] === 'render-vertical' && !booleanOption(input.options, 'dubbed', false)
+      ? 'vertical_subtitle' : 'target_subtitle';
     const source = input.stage.inputArtifacts.find(artifact => artifact.kind === kind)
       ?? input.stage.inputArtifacts.find(artifact => artifact.kind === 'target_subtitle');
     const readCues = (artifact: typeof source): SubtitleRenderCueInput[] => {
@@ -189,8 +212,15 @@ export async function runKrillinCli(input: RunKrillinCliInput): Promise<KrillinR
     if (cues.length > 0) {
       const snapshot = source?.metadata.settingsSnapshot;
       const position = snapshot && typeof snapshot === 'object' && !Array.isArray(snapshot) && snapshot.subtitlePosition === 'bottom' ? 'bottom' : 'top';
+      const sourceVideo = input.stage.inputArtifacts.find(artifact => artifact.kind === 'source_video');
+      const horizontal = args[0] === 'render-horizontal';
+      const width = typeof sourceVideo?.metadata.width === 'number' && Number.isInteger(sourceVideo.metadata.width) && sourceVideo.metadata.width >= 32
+        ? sourceVideo.metadata.width : horizontal ? 1920 : 1080;
+      const height = typeof sourceVideo?.metadata.height === 'number' && Number.isInteger(sourceVideo.metadata.height) && sourceVideo.metadata.height >= 32
+        ? sourceVideo.metadata.height : horizontal ? 1080 : 1920;
       const documentPath = join(configDir, 'subtitle-document.json');
       await writeFile(documentPath, JSON.stringify({
+        width, height, horizontal,
         bilingual: booleanOption(input.options, 'bilingual', false), subtitlePosition: booleanOption(input.options, 'bilingualTop', true) ? 'top' : 'bottom',
         majorTitle: args[0] === 'render-vertical' ? stringOption(input.options, 'verticalTitle') : undefined,
         minorTitle: args[0] === 'render-vertical' ? stringOption(input.options, 'verticalSubtitle') : undefined,
@@ -245,6 +275,8 @@ export async function runKrillinCli(input: RunKrillinCliInput): Promise<KrillinR
       ...translationReport,
       ...(translationReport.translationStatus === 'partial'
         ? { message: `Translation finished with ${translationReport.translationFailedCount} untranslated items` }
+        : translationReport.translationStatus === 'degraded'
+        ? { message: 'Translation finished with automatic quality checks pending review' }
         : translationReport.translationStatus === 'layout_pending'
         ? { message: 'Translation finished; some subtitle layouts need adjustment' }
         : {}),
@@ -329,7 +361,9 @@ export function buildKrillinCliCommandArguments(
   if (command === 'tts') {
     const target = artifactPath(artifacts, 'target_subtitle');
     const bilingual = artifactPath(artifacts, 'bilingual_subtitle');
-    const subtitle = target ?? bilingual;
+    const subtitle = stage.stageRun.stageId === 'tts' && target
+      ? join(stage.workdir, 'target_language_srt.srt')
+      : target ?? bilingual;
     if (!subtitle) throw new CreatorExecutorError('creator_stage_input_missing', 'TTS subtitle input is required');
     const lineMode = target
       ? 'target-only'
@@ -365,7 +399,7 @@ export function buildKrillinCliCommandArguments(
     const vertical = artifactPath(artifacts, 'vertical_subtitle');
     const target = artifactPath(artifacts, 'target_subtitle');
     const bilingual = artifactPath(artifacts, 'bilingual_subtitle');
-    const subtitle = command === 'render-vertical'
+    const subtitle = command === 'render-vertical' && !dubbed
       ? vertical ?? (booleanOption(options, 'bilingual', false) ? bilingual ?? target : target ?? bilingual)
       : booleanOption(options, 'bilingual', false) && bilingual
         ? bilingual
@@ -426,6 +460,7 @@ function executeCli(input: {
   signal: AbortSignal;
 }): Promise<KrillinCliResponse> {
   return new Promise((resolvePromise, reject) => {
+    const reportProgress = createMonotonicProgressReporter(input.reportProgress);
     const child = spawnCreatorProcess(input.executable, input.args, {
       cwd: input.cwd,
       env: createKrillinCliEnvironment(
@@ -446,7 +481,7 @@ function executeCli(input: {
       stdout = boundedAppend(stdout, value);
       pendingStdoutLine = consumeProgressLines(
         pendingStdoutLine + value,
-        input.reportProgress
+        reportProgress
       );
     });
     child.stderr?.on('data', chunk => { stderr = boundedAppend(stderr, String(chunk)); });
@@ -456,7 +491,7 @@ function executeCli(input: {
         reject(new CreatorExecutorError('creator_stage_canceled', 'Creator stage was canceled'));
         return;
       }
-      reportProgressLine(pendingStdoutLine, input.reportProgress);
+      reportProgressLine(pendingStdoutLine, reportProgress);
       const response = parseResponse(stdout);
       if (response === undefined) {
         reject(new KrillinCliError(
@@ -479,12 +514,36 @@ function executeCli(input: {
   });
 }
 
+function createMonotonicProgressReporter(
+  reportProgress: (progress: Record<string, CreatorJson>) => void
+): (progress: Record<string, CreatorJson>) => void {
+  let lastPercent = 0;
+  return progress => {
+    const incomingPercent = progress.percent;
+    if (typeof incomingPercent !== 'number' || !Number.isFinite(incomingPercent)) {
+      reportProgress(progress);
+      return;
+    }
+    const percent = Math.max(lastPercent, Math.max(0, Math.min(99, Math.round(incomingPercent))));
+    lastPercent = percent;
+    const legacyPayload = progress.krillinEventPayload;
+    const nextLegacyPayload = legacyPayload && typeof legacyPayload === 'object' && !Array.isArray(legacyPayload)
+      ? { ...legacyPayload, percent }
+      : undefined;
+    reportProgress({
+      ...progress,
+      percent,
+      ...(nextLegacyPayload === undefined ? {} : { krillinEventPayload: nextLegacyPayload })
+    });
+  };
+}
+
 async function collectArtifacts(
   input: RunKrillinCliInput,
   response: KrillinCliResponse
 ): Promise<KrillinResultArtifact[]> {
   const mappings = outputMappings(input.stage.stageRun.stageId);
-  const result: KrillinResultArtifact[] = [];
+  const candidates: Array<{ field: string; kind: string; path: string }> = [];
   const jobRoot = await realpath(resolve(input.jobsRoot, input.stage.job.id));
   for (const [field, kind] of mappings) {
     if (kind === 'source_video' && input.stage.stageRun.stageId !== 'subtitle' && input.artifacts.some(artifact => artifact.kind === 'source_video')) continue;
@@ -502,6 +561,17 @@ async function collectArtifacts(
     }
     const info = await stat(path);
     if (!info.isFile() || info.size === 0) continue;
+    candidates.push({ field, kind, path });
+  }
+  await normalizeSimplifiedChineseSubtitleOutputs(candidates, {
+    originLanguage: input.options.originLanguage,
+    targetLanguage: input.options.targetLanguage,
+    bilingualTop: booleanOption(input.options, 'bilingualTop', true)
+  });
+  const result: KrillinResultArtifact[] = [];
+  for (const { field, kind, path } of candidates) {
+    const info = await stat(path);
+    if (!info.isFile() || info.size === 0) continue;
     result.push({
       id: `${input.stage.stageRun.id}:${kind}`,
       kind,
@@ -516,17 +586,19 @@ async function collectArtifacts(
   return result;
 }
 
-export function krillinTranslationReport(response: Pick<KrillinCliResponse, 'warnings' | 'translation_failures'>): Record<string, CreatorJson> {
+export function krillinTranslationReport(response: Pick<KrillinCliResponse, 'warnings' | 'translation_failures' | 'subtitle_quality'>): Record<string, CreatorJson> {
   const warnings = (response.warnings ?? []).filter(value => typeof value === 'string' && value.trim());
   const failures = (response.translation_failures ?? []).filter(value => value && typeof value.sentence_id === 'string'
     && typeof value.source_text === 'string' && typeof value.reason === 'string');
   return {
     translationStatus: failures.length > 0 ? 'partial'
+      : response.subtitle_quality?.status === 'degraded' || response.subtitle_quality?.status === 'failed' ? 'degraded'
       : warnings.some(value => value.startsWith('字幕排版待调整：')) ? 'layout_pending' : 'complete',
     translationFailedCount: failures.length,
     translationLayoutPending: warnings.some(value => value.startsWith('字幕排版待调整：')),
     translationFailures: failures.map(value => ({ sentenceId: value.sentence_id, sourceText: value.source_text, reason: value.reason })),
-    translationWarnings: warnings
+    translationWarnings: warnings,
+    ...(response.subtitle_quality === undefined ? {} : { subtitleQuality: { ...response.subtitle_quality } })
   };
 }
 
@@ -544,7 +616,14 @@ export function outputMappings(stageId: string): Array<[string, string]> {
       ['short_origin_mixed_srt', 'vertical_subtitle']
     ];
   }
-  if (stageId === 'tts') return [['origin_video', 'source_video'], ['tts_audio', 'dubbed_audio'], ['video_with_tts', 'dubbed_video']];
+  if (stageId === 'tts') return [
+    ['origin_video', 'source_video'],
+    ['origin_srt', 'source_subtitle'],
+    ['target_srt', 'target_subtitle'],
+    ['bilingual_srt', 'bilingual_subtitle'],
+    ['tts_audio', 'dubbed_audio'],
+    ['video_with_tts', 'dubbed_video']
+  ];
   if (stageId === 'render-horizontal') return [['origin_video', 'source_video'], ['horizontal_video', 'horizontal_video']];
   if (stageId === 'render-vertical') return [['origin_video', 'source_video'], ['vertical_video', 'vertical_video']];
   return [];
